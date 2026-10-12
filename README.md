@@ -51,6 +51,13 @@ Both a native Claude executable and an npm-installed Claude JavaScript entrypoin
 
 From PowerShell or Command Prompt:
 
+Open your project folder first; Claude works in the directory where you start the receiver.
+For example, in PowerShell:
+
+```powershell
+Set-Location 'E:\Git Projects\claude-share'
+```
+
 ```text
 node dist/claude-connect/index.js --share "claudeshare://HOST:PORT/connect/CODE"
 
@@ -88,7 +95,7 @@ Every CONNECT destination must use port 443, match an approved domain, and resol
 
 Token injection is limited to:
 
-- `api.anthropic.com`: exact `/api/hello`, `POST /v1/messages`, and `GET /v1/models` paths; query strings are permitted.
+- `api.anthropic.com`: exact `/api/hello`, `POST /v1/messages`, `GET /v1/models`, `GET /api/claude_code/settings`, and `GET /api/claude_code/policy_limits` paths; query strings are permitted. The last two allow Claude to fetch the sharer's managed settings and organization policy. Other methods and subpaths on those policy endpoints are blocked.
 - `platform.anthropic.com`: the existing `/api/auth/` route family.
 - `platform.claude.com`: the existing `/v1/oauth/` route family.
 - `mcp-proxy.anthropic.com`: the existing domain-wide MCP route family.
@@ -96,6 +103,7 @@ Token injection is limited to:
 The authenticated CONNECT destination, request authority, upstream destination, and upstream TLS must agree before injecting the token.
 Files, fine-tuning, assistants, and unlisted Anthropic API paths are blocked.
 Intercepted WebSocket upgrades are rejected because the proxy dependency handles them outside the validated HTTP request path.
+Forwarding policy requests does not enable other unlisted API routes or WebSockets; features requiring those remain unavailable through this proxy.
 
 `raw.githubusercontent.com` is permitted as an opaque passthrough tunnel.
 Additional domains can be enabled explicitly on the sharer:

@@ -126,7 +126,10 @@ export function requestAllowed(host: string, method: string, target: string): bo
     return (
       pathname === "/api/hello" ||
       (pathname === "/v1/messages" && method === "POST") ||
-      (pathname === "/v1/models" && method === "GET")
+      (method === "GET" &&
+        (pathname === "/v1/models" ||
+          pathname === "/api/claude_code/settings" ||
+          pathname === "/api/claude_code/policy_limits"))
     );
   if (host === "platform.anthropic.com") return pathname.startsWith("/api/auth/");
   if (host === "platform.claude.com") return pathname.startsWith("/v1/oauth/");

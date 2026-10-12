@@ -46,6 +46,12 @@ test(
       requests++;
       assert.equal(req.headers.authorization, "Bearer DUMMY_SHARER_TOKEN");
       assert.equal(req.headers["x-api-key"], undefined);
+      if (req.url?.startsWith("/api/claude_code/")) {
+        assert.equal(req.method, "GET");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ settings: {}, policy: "fixture" }));
+        return;
+      }
       res.writeHead(200, { "Content-Type": "text/event-stream", "Set-Cookie": "secret=fixture" });
       res.write("data: first\n\n");
       setTimeout(() => res.end("data: second\n\n"), 20);
@@ -119,7 +125,12 @@ test(
       );
       return { socket, response: await response };
     }
-    async function exchange(target: string, host = "api.anthropic.com", innerTls = true) {
+    async function exchange(
+      target: string,
+      host = "api.anthropic.com",
+      innerTls = true,
+      method = "POST",
+    ) {
       const { socket, response } = await connect();
       assert.match(response, /200/);
       const transport = innerTls
@@ -131,12 +142,17 @@ test(
       transport.on("data", (chunk) => (data += chunk.toString()));
       transport.setTimeout(5000, () => transport.destroy(new Error("Exchange timeout")));
       const ended = once(transport, "close");
+      const body = method === "POST" ? "{}" : "";
       transport.write(
-        "POST " +
+        method +
+          " " +
           target +
           " HTTP/1.1\r\nHost: " +
           host +
-          "\r\nX-Api-Key: RECEIVER_KEY\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+          "\r\nX-Api-Key: RECEIVER_KEY\r\nContent-Length: " +
+          body.length +
+          "\r\nConnection: close\r\n\r\n" +
+          body,
       );
       await ended;
       socket.destroy();
@@ -149,15 +165,32 @@ test(
       assert.match(good, /data: second/);
       assert.doesNotMatch(good, /set-cookie/i);
       assert.equal(requests, 1);
-      for (const [target, host, tlsEnabled] of [
-        ["http://evil.example/v1/messages", "api.anthropic.com", true],
-        ["/v1/messages", "evil.example", true],
-        ["/v1/messages", "api.anthropic.com", false],
-        ["/v1/files", "api.anthropic.com", true],
-      ] as const)
-        assert.match(await exchange(target, host, tlsEnabled), /403/);
-      assert.equal(requests, 1, "No denied request reached an upstream");
-      assert.equal(resolutions, 5, "Each tunnel resolves once; requests do not re-resolve DNS");
+      for (const route of ["/api/claude_code/settings", "/api/claude_code/policy_limits"]) {
+        const policy = await exchange(route, "api.anthropic.com", true, "GET");
+        assert.match(policy, /200/);
+        assert.match(policy, /"policy":"fixture"/);
+      }
+      assert.equal(requests, 3);
+      const rejectedRequests = [
+        ["http://evil.example/v1/messages", "api.anthropic.com", true, "POST"],
+        ["/v1/messages", "evil.example", true, "POST"],
+        ["/v1/messages", "api.anthropic.com", false, "POST"],
+        ["/v1/files", "api.anthropic.com", true, "POST"],
+        ["/api/claude_code/settings", "api.anthropic.com", true, "POST"],
+        ["/api/claude_code/policy_limits", "api.anthropic.com", true, "POST"],
+        ["/api/claude_code/settings/extra", "api.anthropic.com", true, "GET"],
+        ["/api/claude_code/policy_limitsX", "api.anthropic.com", true, "GET"],
+        ["/api/claude_code/settings", "evil.example", true, "GET"],
+        ["/api/claude_code/policy_limits", "api.anthropic.com", false, "GET"],
+      ] as const;
+      for (const [target, host, tlsEnabled, method] of rejectedRequests)
+        assert.match(await exchange(target, host, tlsEnabled, method), /403/);
+      assert.equal(requests, 3, "No denied request reached an upstream");
+      assert.equal(
+        resolutions,
+        3 + rejectedRequests.length,
+        "Each tunnel resolves once; requests do not re-resolve DNS",
+      );
       for (const authority of ["evil.example:443", "api.anthropic.com:80", "127.0.0.1:443"]) {
         const result = await connect(authority);
         assert.match(result.response, /403/);
@@ -170,7 +203,7 @@ test(
       const expired = await connect();
       assert.match(expired.response, /407/);
       expired.socket.destroy();
-      assert.equal(requests, 1);
+      assert.equal(requests, 3);
     } finally {
       proxy.close();
       agent.destroy();

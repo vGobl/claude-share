@@ -114,6 +114,17 @@ test("proxy destinations and exact route rules fail closed", async () => {
     ),
   );
   assert.equal(requestAllowed(destination.hostname, "POST", "/v1/messages?stream=true"), true);
+  for (const route of ["/api/claude_code/settings", "/api/claude_code/policy_limits"]) {
+    assert.equal(requestAllowed(destination.hostname, "GET", route), true);
+    assert.equal(requestAllowed(destination.hostname, "GET", route + "?version=2.1.292"), true);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "HEAD"])
+      assert.equal(requestAllowed(destination.hostname, method, route), false);
+    for (const invalidRoute of [route + "/extra", route + "X", route + "/../metrics"])
+      assert.equal(requestAllowed(destination.hostname, "GET", invalidRoute), false);
+    assert.equal(requestAllowed("platform.anthropic.com", "GET", route), false);
+    assert.equal(requestAllowed("evil.example", "GET", route), false);
+  }
+  assert.equal(requestAllowed(destination.hostname, "GET", "/api/claude_code/metrics"), false);
   for (const route of [
     "/v1/messages/extra",
     "/v1/messagesX",
