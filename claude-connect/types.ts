@@ -8,7 +8,7 @@ export interface SavedConnection {
   lanServerUrl: string | null;
   publicServerUrl: string | null;
   sessionId: string;
-  sharedUntil: string; // ISO-8601 — used to prune expired connections on startup
+  sharedUntil: string; // ISO-8601; UNLIMITED_SHARED_UNTIL keeps unlimited connections
   caPem: string;
   savedAt: string;
   sharerAccount: SharerAccount | null;

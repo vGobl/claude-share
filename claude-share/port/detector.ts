@@ -1,37 +1,48 @@
 import net from "node:net";
 
-import { logger } from "../logger";
-
 type Handler = (socket: net.Socket) => void;
-
 interface PortDetectorOptions {
-  onConnect: Handler; // HTTP CONNECT (proxy traffic)
-  onHttp: Handler; // plain HTTP (API server traffic)
-  onTls: Handler; // TLS ClientHello (HTTPS API traffic)
+  onConnect: Handler;
+  onHttp: Handler;
+  onTls: Handler;
 }
-
-/**
- * Creates a single TCP server that routes connections by sniffing the first bytes.
- * CONNECT → MITM proxy; TLS ClientHello → HTTPS API; plain HTTP → HTTP API.
- */
-export function createPortDetector(options: PortDetectorOptions): net.Server {
+export function sniffSocket(socket: net.Socket, options: PortDetectorOptions, detectTls = true) {
+  let buffered = Buffer.alloc(0);
+  const cleanup = () => {
+    clearTimeout(timer);
+    socket.removeListener("data", data);
+    socket.removeListener("close", cleanup);
+  };
+  const timer = setTimeout(() => {
+    cleanup();
+    socket.destroy();
+  }, 5000);
+  const data = (chunk: Buffer) => {
+    if (buffered.length + chunk.length > 8192) {
+      cleanup();
+      socket.destroy();
+      return;
+    }
+    buffered = Buffer.concat([buffered, chunk]);
+    const prefix = buffered.subarray(0, 8).toString("ascii");
+    const isTls = detectTls && buffered[0] === 0x16;
+    if (!isTls && buffered.length < 8 && "CONNECT ".startsWith(prefix)) return;
+    const handler = isTls
+      ? options.onTls
+      : prefix === "CONNECT "
+        ? options.onConnect
+        : options.onHttp;
+    cleanup();
+    socket.pause();
+    socket.unshift(buffered);
+    handler(socket);
+  };
+  socket.on("data", data);
+  socket.once("close", cleanup);
+}
+export function createPortDetector(options: PortDetectorOptions) {
   return net.createServer((socket) => {
-    socket.once("data", (chunk) => {
-      // HTTP CONNECT starts with "CONNECT "
-      const isConnect = chunk.slice(0, 8).toString("ascii").toUpperCase().startsWith("CONNECT");
-      // TLS ClientHello starts with 0x16 (content type: handshake)
-      const isTls = !isConnect && chunk[0] === 0x16;
-
-      const handler = isConnect ? options.onConnect : isTls ? options.onTls : options.onHttp;
-      socket.unshift(chunk);
-      handler(socket);
-    });
-
-    socket.on("error", (err) => {
-      if ((err as NodeJS.ErrnoException).code !== "ECONNRESET") {
-        logger.error("[detector] socket error", err);
-      }
-    });
+    socket.on("error", () => socket.destroy());
+    sniffSocket(socket, options);
   });
 }
-

@@ -1,16 +1,12 @@
-import fs from "node:fs";
-
 import * as p from "@clack/prompts";
+import { atomicPrivateWrite } from "@shared/private-files";
+import { serverUrl as validateServerUrl } from "@shared/validation";
 
 import { apiFetch } from "../fetch";
 import { launchClaude } from "../launch";
 import { logger } from "../logger";
-import { decryptBlob, parseConnectUrl } from "../pairing";
-import {
-  connectionPath,
-  ensureConnectionsDir,
-  getDeviceName,
-} from "../storage";
+import { decodePairingKey, decryptBlob, parseConnectUrl } from "../pairing";
+import { connectionPath, ensureConnectionsDir, getDeviceName } from "../storage";
 import type { ConnectionFile, SavedConnection } from "../types";
 
 export async function pairFlow(
@@ -58,6 +54,8 @@ export async function pairFlow(
     }
   }
 
+  serverUrl = validateServerUrl(serverUrl);
+  decodePairingKey(pairingCode);
   const name = getDeviceName();
   p.log.info(`Connecting as "${name}"`);
 
@@ -90,8 +88,7 @@ export async function pairFlow(
     const data = (await res.json()) as { blob: string; machineId: string };
     blob = data.blob;
     connectionId = data.machineId;
-    const UUID_RE =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (!UUID_RE.test(connectionId)) {
       spin.stop("Failed.");
       p.log.error("Server returned an invalid machine ID.");
@@ -107,6 +104,10 @@ export async function pairFlow(
   let file: ConnectionFile;
   try {
     file = decryptBlob(blob, pairingCode);
+    if (connectionId !== file.proxyUser || Date.parse(file.sharedUntil) <= Date.now())
+      throw new Error("Invalid connection identity or expired session");
+    if (![file.publicServerUrl, file.lanServerUrl].includes(serverUrl))
+      throw new Error("Pairing origin does not match the encrypted connection");
   } catch {
     spin.stop("Decryption failed.");
     p.log.error("Wrong pairing code or corrupted response.");
@@ -129,16 +130,7 @@ export async function pairFlow(
     proxyUser: file.proxyUser,
     proxyPass: file.proxyPass,
   };
-  fs.writeFileSync(
-    connectionPath(connectionId),
-    JSON.stringify(saved, null, 2),
-  );
+  atomicPrivateWrite(connectionPath(connectionId), JSON.stringify(saved, null, 2));
 
-  await launchClaude(
-    serverUrl,
-    file.caPem,
-    saved,
-    claudeArgs,
-    file.sharerAccount ?? null,
-  );
+  await launchClaude(serverUrl, file.caPem, saved, claudeArgs, file.sharerAccount ?? null);
 }

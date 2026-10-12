@@ -3,9 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+
 import * as p from "@clack/prompts";
 
 import pkg from "../package.json";
+import { resolveExecutable } from "./executables";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,11 +30,9 @@ function patchConfig(patch: Record<string, unknown>): void {
   try {
     const dir = path.dirname(CONFIG_FILE);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(
-      CONFIG_FILE,
-      JSON.stringify({ ...readConfig(), ...patch }, null, 2),
-      { mode: 0o600 },
-    );
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...readConfig(), ...patch }, null, 2), {
+      mode: 0o600,
+    });
   } catch {}
 }
 
@@ -125,9 +125,12 @@ function scheduleVersionCheck(): void {
           signal: controller.signal,
           headers: { Accept: "application/vnd.npm.install-v1+json" },
         });
-        clearTimeout(timer);
-        if (!res.ok) return;
+        if (!res.ok) {
+          clearTimeout(timer);
+          return;
+        }
         text = (await res.text()).trim();
+        clearTimeout(timer);
       } catch {
         clearTimeout(timer);
         return;
@@ -163,10 +166,14 @@ async function detectPackageManager(): Promise<string | null> {
 
 function installArgs(pm: string): [string, string[]] {
   switch (pm) {
-    case "bun": return ["bun", ["install", "-g", `${PACKAGE_NAME}@latest`]];
-    case "pnpm": return ["pnpm", ["add", "-g", `${PACKAGE_NAME}@latest`]];
-    case "yarn": return ["yarn", ["global", "add", `${PACKAGE_NAME}@latest`]];
-    default: return ["npm", ["install", "-g", `${PACKAGE_NAME}@latest`]];
+    case "bun":
+      return ["bun", ["install", "-g", `${PACKAGE_NAME}@latest`]];
+    case "pnpm":
+      return ["pnpm", ["add", "-g", `${PACKAGE_NAME}@latest`]];
+    case "yarn":
+      return ["yarn", ["global", "add", `${PACKAGE_NAME}@latest`]];
+    default:
+      return ["npm", ["install", "-g", `${PACKAGE_NAME}@latest`]];
   }
 }
 
@@ -185,7 +192,11 @@ async function attemptUpgrade(): Promise<void> {
   const spin = p.spinner();
   spin.start(`Upgrading via ${pm}…`);
   try {
-    await execFileAsync(cmd, args, { timeout: 90_000 });
+    const executable = resolveExecutable(cmd);
+    await execFileAsync(executable.command, [...executable.args, ...args], {
+      timeout: 90_000,
+      windowsHide: true,
+    });
     spin.stop("Upgraded successfully. Please restart the CLI.");
     process.exit(0);
   } catch (err) {
@@ -244,15 +255,16 @@ export async function forceUpgrade(): Promise<void> {
 /**
  * Call once at CLI startup.
  *
- * Phase 1 (sync): reads config — if isUpgradeAvailable is true, upgrades now.
+ * Phase 1 (sync): reads config — if isUpgradeAvailable is true, shows a notice.
  * Phase 2 (async): fires a background version fetch; writes the flag for next run.
  * All errors are swallowed — this must never crash the caller.
  */
 export async function checkForUpdate(): Promise<void> {
   try {
     if (readConfig()["isUpgradeAvailable"] === true) {
-      p.log.warn(`A newer version of ${PACKAGE_NAME} is available. Upgrading…`);
-      await attemptUpgrade();
+      p.log.info(
+        `A newer version of ${PACKAGE_NAME} is available. Run with --upgrade to install it.`,
+      );
     }
   } catch {}
 

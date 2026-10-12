@@ -1,24 +1,28 @@
 #!/usr/bin/env node
 import "@shared/patch-console";
 import * as p from "@clack/prompts";
-
-import { platform } from "@shared/platforms";
 import { checkForUpdate, forceUpgrade } from "@shared/checkVersion";
-import pkg from "../package.json";
+import { platform } from "@shared/platforms";
 
-if (process.argv.includes("-v") || process.argv.includes("--version")) {
+import pkg from "../package.json";
+import { parseArgs } from "./args";
+
+const wrapperArgs = process.argv.slice(2);
+const separator = wrapperArgs.indexOf("--");
+const ownArgs = separator < 0 ? wrapperArgs : wrapperArgs.slice(0, separator);
+if (ownArgs.includes("-v") || ownArgs.includes("--version")) {
   process.stdout.write(pkg.version + "\n");
   process.exit(0);
 }
 
-if (process.argv.includes("--upgrade")) {
+if (ownArgs.includes("--upgrade")) {
   await forceUpgrade();
   process.exit(0);
 }
 
+import { listFlow } from "./flows/list";
 import { pairFlow } from "./flows/pair";
 import { reconnectFlow } from "./flows/reconnect";
-import { listFlow } from "./flows/list";
 import { resolveActiveUrl } from "./health";
 import { launchClaude } from "./launch";
 import { logger } from "./logger";
@@ -33,11 +37,13 @@ import {
 
 process.on("uncaughtException", (err) => {
   logger.error("Uncaught exception", err);
+  p.log.error(err.message);
   process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
   logger.error("Unhandled rejection", reason);
+  p.log.error(reason instanceof Error ? reason.message : String(reason));
   process.exit(1);
 });
 
@@ -51,19 +57,14 @@ await checkForUpdate();
 const args = process.argv.slice(2);
 
 // Identify which arg indices belong to claude-connect itself
-const ownIdxs = new Set<number>();
-args.forEach((a, i) => {
-  if (a === "--list" || a === "-l") ownIdxs.add(i);
-  if (a === "--cleanup") ownIdxs.add(i);
-  if (a === "--reconnect" || a === "-r") {
-    ownIdxs.add(i);
-    if (args[i + 1] && !args[i + 1].startsWith("-")) ownIdxs.add(i + 1);
-  }
-  if (a.startsWith("--share=")) ownIdxs.add(i);
-});
-
-const claudeArgs = args.filter((_, i) => !ownIdxs.has(i));
-const shareArg = args.find((a) => a.startsWith("--share="));
+let parsedArgs: ReturnType<typeof parseArgs>;
+try {
+  parsedArgs = parseArgs(args);
+} catch (err) {
+  p.log.error((err as Error).message);
+  process.exit(1);
+}
+const { claudeArgs } = parsedArgs;
 
 pruneExpiredConnections();
 
@@ -71,8 +72,8 @@ if (!hasAgreedToTerms()) {
   p.intro("claude-connect");
   p.log.warn(
     "Heads up: you're connecting to someone else's Claude Code at your own discretion.\n" +
-      "By design, the sharer's machine could potentially see your Claude Code messages\n" +
-      "if they're running a modified, unofficial build of this program. Please connect\n" +
+      "The proxy decrypts Claude traffic on the sharer's machine.\n" +
+      "Please connect\n" +
       "only to people you trust.\n\n" +
       "Once connected, you might still see your own email or organization name shown\n" +
       "in Claude Code. That's expected behavior and safe to ignore.",
@@ -90,17 +91,15 @@ if (!hasAgreedToTerms()) {
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
-if (args[0] === "--list" || args[0] === "-l") {
+if (parsedArgs.list) {
   await listFlow();
-} else if (args[0] === "--reconnect" || args[0] === "-r") {
-  await reconnectFlow(args[1], claudeArgs);
-} else if (shareArg) {
-  const connectUrl = shareArg.slice("--share=".length).trim();
+} else if (parsedArgs.reconnect !== undefined) {
+  await reconnectFlow(parsedArgs.reconnect || undefined, claudeArgs);
+} else if (parsedArgs.share) {
+  const connectUrl = parsedArgs.share.trim();
   const parsed = parseConnectUrl(connectUrl);
   if (!parsed) {
-    p.log.error(
-      "Invalid --share URL. Expected: claudeshare://host:port/connect/CODE",
-    );
+    p.log.error("Invalid --share URL. Expected: claudeshare://host:port/connect/CODE");
     process.exit(1);
   }
 

@@ -5,10 +5,7 @@ import { launchClaude } from "../launch";
 import { loadConnections } from "../storage";
 import type { SavedConnection } from "../types";
 
-export async function reconnectFlow(
-  uuid?: string,
-  claudeArgs: string[] = [],
-) {
+export async function reconnectFlow(uuid?: string, claudeArgs: string[] = []) {
   const connections = loadConnections();
 
   if (connections.length === 0) {
@@ -45,17 +42,11 @@ export async function reconnectFlow(
   const spin = p.spinner();
   spin.start(`Checking ${chosen.systemName}...`);
   const resolved = await resolveActiveUrl(chosen);
-  if (!resolved.alive) {
+  if (!resolved.alive || resolved.sessionId !== chosen.sessionId) {
     spin.stop("Server offline or session expired.");
     process.exit(1);
   }
   spin.stop("Server is alive.");
 
-  await launchClaude(
-    resolved.url,
-    chosen.caPem,
-    chosen,
-    claudeArgs,
-    chosen.sharerAccount ?? null,
-  );
+  await launchClaude(resolved.url, chosen.caPem, chosen, claudeArgs, chosen.sharerAccount ?? null);
 }

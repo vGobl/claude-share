@@ -1,4 +1,5 @@
 import https from "node:https";
+import { isIP } from "node:net";
 
 export interface ApiFetchOptions {
   method?: string;
@@ -6,24 +7,18 @@ export interface ApiFetchOptions {
   body?: string;
   timeout?: number;
   signal?: AbortSignal;
-  /** CA cert PEM — enables TLS verification for HTTPS requests */
   ca?: string;
-  /** Skip TLS verification entirely (safe for the first /pair call since the response is E2E encrypted) */
   rejectUnauthorized?: boolean;
 }
-
 export interface ApiFetchResponse {
   ok: boolean;
   status: number;
   json(): Promise<unknown>;
 }
-
-// Native fetch can't be given a custom CA cert, so we use node:https for HTTPS
-// URLs (once the CA cert is known) and fall back to native fetch for HTTP.
-export async function apiFetch(
-  url: string,
-  opts: ApiFetchOptions = {},
-): Promise<ApiFetchResponse> {
+export async function apiFetch(url: string, opts: ApiFetchOptions = {}): Promise<ApiFetchResponse> {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password)
+    throw new Error("API requests require HTTPS without URL credentials");
   const {
     ca,
     rejectUnauthorized = true,
@@ -33,55 +28,52 @@ export async function apiFetch(
     headers = {},
     body,
   } = opts;
-
-  if (url.startsWith("https:")) {
-    return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const req = https.request(
-        {
-          hostname: parsed.hostname,
-          port: parseInt(parsed.port || "443", 10),
-          path: parsed.pathname + parsed.search,
-          method,
-          headers,
-          ca,
-          rejectUnauthorized,
-
-          // Important: node fails to derive servername automatically when dealing with IP based URLs
-          servername: parsed.hostname,
-        },
-        (res) => {
-          let data = "";
-          res.on("data", (chunk: string) => {
-            data += chunk;
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ""),
+        port: Number(parsed.port || 443),
+        path: parsed.pathname + parsed.search,
+        method,
+        headers,
+        ca,
+        rejectUnauthorized,
+        servername: isIP(parsed.hostname.replace(/^\[|\]$/g, "")) ? undefined : parsed.hostname,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 512 * 1024) return req.destroy(new Error("API response too large"));
+          chunks.push(chunk);
+        });
+        res.once("aborted", () => req.destroy(new Error("API response aborted")));
+        res.once("error", reject);
+        res.once("end", () => {
+          const status = res.statusCode ?? 0;
+          const data = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            json: async () => JSON.parse(data),
           });
-          res.on("end", () => {
-            const status = res.statusCode ?? 0;
-            resolve({
-              ok: status >= 200 && status < 300,
-              status,
-              json: () => Promise.resolve(JSON.parse(data)),
-            });
-          });
-          res.on("error", reject);
-        },
-      );
-      req.setTimeout(timeout, () =>
-        req.destroy(new Error("Request timed out")),
-      );
-      signal?.addEventListener("abort", () =>
-        req.destroy(new Error("Aborted")),
-      );
-      req.on("error", reject);
-      if (body) req.write(body);
-      req.end();
+        });
+      },
+    );
+    const timer = setTimeout(() => req.destroy(new Error("Request timed out")), timeout);
+    const abort = () => req.destroy(new Error("Aborted"));
+    signal?.addEventListener("abort", abort, { once: true });
+    req.once("close", () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
     });
-  }
-
-  // HTTP — use native fetch
-  const fetchSignal = signal
-    ? AbortSignal.any([signal, AbortSignal.timeout(timeout)])
-    : AbortSignal.timeout(timeout);
-  const res = await fetch(url, { method, headers, body, signal: fetchSignal });
-  return { ok: res.ok, status: res.status, json: () => res.json() };
+    req.once("error", reject);
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    if (body) req.write(body);
+    req.end();
+  });
 }

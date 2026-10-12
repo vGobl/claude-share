@@ -1,52 +1,34 @@
-import { platform } from "@shared/platforms";
-import type { OAuthCredentials } from "@shared/platforms";
+import { platform, type OAuthCredentials } from "@shared/platforms";
+
 import { logger } from "../logger";
-
-// In-memory only — token never written to disk
 let cached: OAuthCredentials | null = null;
-let refreshTimer: NodeJS.Timeout | null = null;
-
-// Claude Code manages the OAuth refresh cycle on the sharer's machine and writes
-// the updated token back to its credential store. We re-read before expiry so
-// we're never caught with a stale token.
-function scheduleTokenReread(creds: OAuthCredentials): void {
-  if (refreshTimer) clearTimeout(refreshTimer);
-  const msUntilReread = Math.max(
-    creds.expiresAt - Date.now() - 5 * 60 * 1000,
-    60_000,
-  );
-  refreshTimer = setTimeout(async () => {
-    try {
-      cached = await platform().readOAuthCredentials();
-      scheduleTokenReread(cached);
-    } catch (err) {
-      logger.error("[token] credential re-read failed", err);
-      refreshTimer = setTimeout(() => scheduleTokenReread(creds), 60_000);
-      refreshTimer.unref();
-    }
-  }, msUntilReread);
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+let generation = 0;
+export async function initToken(configDir?: string) {
+  stopTokenRefresh();
+  const current = generation;
+  cached = await platform().readOAuthCredentials(configDir);
+  refreshTimer = setInterval(() => {
+    void platform()
+      .readOAuthCredentials(configDir)
+      .then((creds) => {
+        if (current === generation) cached = creds;
+      })
+      .catch((err) => logger.error("[token] credential re-read failed", err));
+  }, 60_000);
   refreshTimer.unref();
 }
-
-export async function initToken(): Promise<void> {
-  cached = await platform().readOAuthCredentials();
-  scheduleTokenReread(cached);
-}
-
-export function getAccessToken(): string {
-  if (!cached)
-    throw new Error("Token not initialized — call initToken() first");
+export function getAccessToken() {
+  if (!cached || !cached.accessToken || cached.expiresAt <= Date.now())
+    throw new Error("Sharer OAuth token unavailable or expired");
   return cached.accessToken;
 }
-
-export function getSubscriptionType(): string {
+export function getSubscriptionType() {
   return cached?.subscriptionType ?? "unknown";
 }
-
-export function stopTokenRefresh(): void {
-  if (refreshTimer) {
-    clearTimeout(refreshTimer);
-    refreshTimer = null;
-  }
+export function stopTokenRefresh() {
+  generation++;
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = null;
   cached = null;
 }

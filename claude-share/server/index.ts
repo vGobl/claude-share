@@ -1,15 +1,19 @@
+import { record, text, uuid } from "@shared/validation";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 
 import {
   getSession,
   checkPairingCode,
-  checkMachineAuth,
+  authenticateMachine,
   addMachine,
   encryptConnectionFile,
   isSessionExpired,
   addMachineSession,
   endMachineSession,
   heartbeatMachineSession,
+  pairingLimited,
+  recordPairingFailure,
   type ConnectionFile,
   type SharerAccount,
 } from "../session/manager";
@@ -18,28 +22,31 @@ interface Urls {
   public: string | null;
   lan: string | null;
 }
-
 export function createApiApp(
   urls: Urls,
   caPem: string,
   sharerAccount: SharerAccount | null,
   systemName: string,
-): Hono {
-  const app = new Hono();
-
-  app.use("*", async (c, next) => {
-    const p = c.req.path;
-    if (p === "/health" || p === "/pair" || p.startsWith("/connect/")) {
-      return next();
-    }
-    const session = getSession();
-    const auth = c.req.header("proxy-authorization");
-    if (!auth || !session || !checkMachineAuth(session, auth)) {
-      return c.text("Unauthorized", 407);
-    }
-    return next();
+) {
+  const app = new Hono<{ Variables: { machineId: string } }>();
+  app.use(
+    "*",
+    bodyLimit({ maxSize: 4096, onError: (c) => c.json({ error: "Request body too large" }, 413) }),
+  );
+  app.onError((_err, c) => {
+    if (c.req.path === "/pair") recordPairingFailure();
+    return c.json({ error: "Invalid request body" }, 400);
   });
-
+  app.use("*", async (c, next) => {
+    if (c.req.path === "/health" || c.req.path === "/pair" || c.req.path.startsWith("/connect/"))
+      return next();
+    const session = getSession();
+    const machine =
+      session && authenticateMachine(session, c.req.header("proxy-authorization") ?? "");
+    if (!machine) return c.json({ error: "Unauthorized or expired session" }, 407);
+    c.set("machineId", machine.id);
+    await next();
+  });
   app.get("/health", (c) => {
     const session = getSession();
     return c.json({
@@ -48,35 +55,23 @@ export function createApiApp(
       sessionId: session?.id ?? null,
     });
   });
-
-  /** GET /connect/:code — human-readable hint when someone opens the URL in a browser */
-  app.get("/connect/:code", (c) => {
-    const url = c.req.url;
-    return c.text(
-      `This is a claude-share connect link — it cannot be opened in a browser.\n\n` +
-        `Run this instead:\n\n  claude-connect --share "${url}"\n`,
-      200,
-      { "Content-Type": "text/plain; charset=utf-8" },
-    );
-  });
-
-  /** POST /pair — one-time pairing with a machine */
+  app.get("/connect/:code", (c) =>
+    c.text(
+      "Paste the original connect link into claude-connect. Keep it private; it contains the pairing key.",
+    ),
+  );
   app.post("/pair", async (c) => {
+    if (pairingLimited())
+      return c.json({ error: "Too many pairing failures; retry in one minute" }, 429);
     const session = getSession();
-    if (!session || isSessionExpired(session))
-      return c.json({ error: "No active session" }, 503);
-
-    const ip =
-      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
-    const body = await c.req.json<{ code?: string; name?: string }>();
-    const code = body.code?.trim() ?? "";
-    const name = body.name?.trim() ?? "unknown device";
-
-    if (!checkPairingCode(session, ip, code))
-      return c.json({ error: "Invalid pairing code" }, 401);
-
+    if (!session || isSessionExpired(session)) return c.json({ error: "No active session" }, 503);
+    const body = record(await c.req.json());
+    const code = text(body.code, "pairing prefix", 5);
+    const name = text(body.name ?? "unknown device", "device name", 128).trim();
+    if (!name) throw new Error("Empty device name");
+    if (!checkPairingCode(session, code))
+      return c.json({ error: "Invalid or already used pairing code" }, 401);
     const machine = addMachine(session, name);
-
     const file: ConnectionFile = {
       publicServerUrl: urls.public,
       lanServerUrl: urls.lan,
@@ -88,62 +83,51 @@ export function createApiApp(
       proxyUser: machine.id,
       proxyPass: machine.proxyPass,
     };
-
-    const blob = encryptConnectionFile(session, file);
-    return c.json({ blob, machineId: machine.id });
+    return c.json({ blob: encryptConnectionFile(session, file), machineId: machine.id });
   });
-
-  /** POST /session/start — receiver opened a Claude session */
-  app.post("/session/start", async (c) => {
-    const session = getSession();
-    if (!session) return c.json({ error: "No active session" }, 503);
-    const { machineId } = await c.req.json<{ machineId: string }>();
-    const ms = addMachineSession(session, machineId);
-    if (!ms) return c.json({ error: "Machine not found" }, 404);
-    return c.json({ ok: true, sessionId: ms.id });
-  });
-
-  /** POST /session/end — receiver closed a Claude session */
-  app.post("/session/end", async (c) => {
-    const session = getSession();
-    if (!session) return c.json({ error: "No active session" }, 503);
-    const { machineId, sessionId } = await c.req.json<{
-      machineId: string;
-      sessionId: string;
-    }>();
-    endMachineSession(session, machineId, sessionId);
-    return c.json({ ok: true });
-  });
-
-  /** POST /session/heartbeat — receiver is still alive */
-  app.post("/session/heartbeat", async (c) => {
-    const session = getSession();
-    if (!session) return c.json({ error: "No active session" }, 503);
-    const { machineId, sessionId } = await c.req.json<{
-      machineId: string;
-      sessionId: string;
-    }>();
-    heartbeatMachineSession(session, machineId, sessionId);
-    return c.json({ ok: true });
-  });
-
-  /** GET /machines — list machines and their sessions */
+  for (const endpoint of ["start", "end", "heartbeat"] as const) {
+    app.post("/session/" + endpoint, async (c) => {
+      const session = getSession();
+      if (!session || isSessionExpired(session)) return c.json({ error: "No active session" }, 503);
+      const body = record(await c.req.json());
+      const machineId = uuid(body.machineId);
+      if (machineId !== c.get("machineId"))
+        return c.json({ error: "Session belongs to another machine" }, 403);
+      if (endpoint === "start") {
+        const ms = addMachineSession(session, machineId);
+        return ms
+          ? c.json({ ok: true, sessionId: ms.id })
+          : c.json({ error: "Machine not found" }, 404);
+      }
+      const sessionId = uuid(body.sessionId);
+      const success =
+        endpoint === "end"
+          ? endMachineSession(session, machineId, sessionId)
+          : heartbeatMachineSession(session, machineId, sessionId);
+      return success
+        ? c.json({ ok: true })
+        : c.json({ error: "Session not found or inactive" }, 404);
+    });
+  }
   app.get("/machines", (c) => {
-    const session = getSession();
-    if (!session) return c.json({ machines: [] });
-    const machines = [...session.machines.values()].map((m) => ({
-      id: m.id,
-      name: m.name,
-      pairedAt: m.pairedAt.toISOString(),
-      sessions: [...m.sessions.values()].map((s) => ({
-        id: s.id,
-        startedAt: s.startedAt.toISOString(),
-        lastActiveAt: s.lastActiveAt.toISOString(),
-        active: s.active,
-      })),
-    }));
-    return c.json({ machines, sharedUntil: session.sharedUntil.toISOString() });
+    const session = getSession()!;
+    const machine = session.machines.get(c.get("machineId"))!;
+    return c.json({
+      machines: [
+        {
+          id: machine.id,
+          name: machine.name,
+          pairedAt: machine.pairedAt.toISOString(),
+          sessions: [...machine.sessions.values()].map((s) => ({
+            id: s.id,
+            startedAt: s.startedAt.toISOString(),
+            lastActiveAt: s.lastActiveAt.toISOString(),
+            active: s.active,
+          })),
+        },
+      ],
+      sharedUntil: session.sharedUntil.toISOString(),
+    });
   });
-
   return app;
 }

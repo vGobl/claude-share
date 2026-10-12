@@ -1,5 +1,5 @@
 {
-  "$schema": "./claude-share/node_modules/oxfmt/configuration_schema.json",
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "printWidth": 100,
   "tabWidth": 2,
   "useTabs": false,
@@ -13,5 +13,5 @@
   "endOfLine": "lf",
   "insertFinalNewline": true,
   "sortImports": true,
-  "ignorePatterns": ["dist/**", "node_modules/**"]
+  "ignorePatterns": ["dist/**", "node_modules/**", "tests/.build/**", ".package-smoke/**"]
 }

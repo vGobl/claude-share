@@ -9,7 +9,7 @@ export interface ConnectionFile {
   publicServerUrl: string | null;
   lanServerUrl: string | null;
   sessionId: string;
-  sharedUntil: string; // ISO-8601
+  sharedUntil: string; // ISO-8601; UNLIMITED_SHARED_UNTIL means no automatic expiry
   caPem: string;
   sharerAccount: SharerAccount | null;
   systemName: string;

@@ -1,33 +1,42 @@
 import { execFile } from "node:child_process";
 
 import * as p from "@clack/prompts";
-
+import { resolveExecutable } from "@shared/executables";
 import { platform } from "@shared/platforms";
+
 import { logger } from "../logger";
 import { initToken } from "./token";
 
 function spawnClaudeForRefresh(): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = execFile("claude", ["-p", "HI"], { timeout: 60_000 }, (err) => {
-      if (err?.killed) {
-        reject(new Error("Claude process timed out after 60s"));
-      } else {
-        // Non-zero exit is acceptable — the OAuth refresh can succeed even if the
-        // prompt itself fails (e.g. rate limit, no Pro plan, etc.).
-        resolve();
-      }
-    });
+    const executable = resolveExecutable("claude");
+    const child = execFile(
+      executable.command,
+      [...executable.args, "-p", "HI"],
+      { timeout: 60_000 },
+      (err) => {
+        if (err?.killed) {
+          reject(new Error("Claude process timed out after 60s"));
+        } else {
+          // Non-zero exit is acceptable — the OAuth refresh can succeed even if the
+          // prompt itself fails (e.g. rate limit, no Pro plan, etc.).
+          resolve();
+        }
+      },
+    );
     child.stdout?.resume();
     child.stderr?.resume();
   });
 }
 
 export async function verifyTokenOrExit(): Promise<void> {
-  const creds = await platform().readOAuthCredentials().catch(() => null);
+  const creds = await platform()
+    .readOAuthCredentials()
+    .catch(() => null);
 
   if (!creds) {
     p.log.error(
-      "Could not read Anthropic credentials from keychain.\n" +
+      "Could not read Claude OAuth credentials.\n" +
         "Please run 'claude' to log in, then restart claude-share.",
     );
     process.exit(1);
@@ -57,7 +66,9 @@ export async function verifyTokenOrExit(): Promise<void> {
     logger.warn("[token] claude spawn error", err);
   }
 
-  spin.stop(spawnOk ? "Claude process exited." : "Claude process failed — checking credentials anyway.");
+  spin.stop(
+    spawnOk ? "Claude process exited." : "Claude process failed — checking credentials anyway.",
+  );
 
   // Re-read and re-cache the (hopefully refreshed) credentials.
   try {
@@ -71,12 +82,14 @@ export async function verifyTokenOrExit(): Promise<void> {
     process.exit(1);
   }
 
-  const fresh = await platform().readOAuthCredentials().catch(() => null);
+  const fresh = await platform()
+    .readOAuthCredentials()
+    .catch(() => null);
   if (!fresh || fresh.expiresAt <= Date.now()) {
     p.log.error(
       "Token is still expired after the refresh attempt.\n" +
         "Your Claude may not be working correctly.\n" +
-        "Try: claude -p \"hello\"\n" +
+        'Try: claude -p "hello"\n' +
         "If it fails, re-login: claude logout && claude login",
     );
     process.exit(1);

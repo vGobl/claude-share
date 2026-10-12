@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import os from "node:os";
 import { promisify } from "node:util";
 
+import fileStore from "./file-store";
 import type { CredentialPayload, OAuthCredentials, PlatformOps } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -12,33 +13,37 @@ function username() {
 }
 
 const darwin: PlatformOps = {
-  async readOAuthCredentials(): Promise<OAuthCredentials> {
+  async readOAuthCredentials(configDir?: string): Promise<OAuthCredentials> {
+    if (configDir) return fileStore.readOAuthCredentials(configDir);
     const { stdout } = await execFileAsync("security", [
       "find-generic-password",
-      "-s", SERVICE,
-      "-a", username(),
+      "-s",
+      SERVICE,
+      "-a",
+      username(),
       "-w",
     ]);
     const payload: CredentialPayload = JSON.parse(stdout.trim());
     return payload.claudeAiOauth;
   },
 
-  async credentialsExist(): Promise<boolean> {
-    return execFileAsync("security", [
-      "find-generic-password",
-      "-s", SERVICE,
-      "-a", username(),
-    ])
+  async credentialsExist(configDir?: string): Promise<boolean> {
+    if (configDir) return fileStore.credentialsExist(configDir);
+    return execFileAsync("security", ["find-generic-password", "-s", SERVICE, "-a", username()])
       .then(() => true)
       .catch(() => false);
   },
 
-  async writeOAuthCredentials(payload: CredentialPayload): Promise<void> {
+  async writeOAuthCredentials(payload: CredentialPayload, configDir?: string): Promise<void> {
+    if (configDir) return fileStore.writeOAuthCredentials(payload, configDir);
     await execFileAsync("security", [
       "add-generic-password",
-      "-s", SERVICE,
-      "-a", username(),
-      "-w", JSON.stringify(payload),
+      "-s",
+      SERVICE,
+      "-a",
+      username(),
+      "-w",
+      JSON.stringify(payload),
       "-U",
     ]);
   },

@@ -6,10 +6,10 @@
     "strict": true,
     "jsx": "react-jsx",
     "skipLibCheck": true,
-    "types": ["node"],
+    "types": ["node", "bun"],
     "paths": {
       "@shared/*": ["./shared/*"],
     },
   },
-  "include": ["claude-share", "claude-connect", "shared", "scripts"],
+  "include": ["claude-share", "claude-connect", "shared", "scripts", "tests"],
 }

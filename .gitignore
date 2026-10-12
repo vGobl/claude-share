@@ -4,3 +4,5 @@ dist/
 .env
 .http-mitm-proxy
 claude-share-dev.log
+tests/.build/
+.package-smoke/

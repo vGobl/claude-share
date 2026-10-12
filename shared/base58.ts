@@ -1,6 +1,7 @@
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 export function toBase58(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
   let num = BigInt("0x" + Buffer.from(bytes).toString("hex"));
   const result: string[] = [];
   while (num > 0n) {
@@ -21,6 +22,8 @@ export function fromBase58(str: string): Uint8Array {
     if (idx === -1) throw new Error(`Invalid base58 character: ${char}`);
     num = num * 58n + BigInt(idx);
   }
-  const hex = num.toString(16).padStart(20, "0"); // at least 10 bytes
-  return Uint8Array.from(Buffer.from(hex, "hex"));
+  const leadingZeros = str.match(/^1*/)?.[0].length ?? 0;
+  let hex = num === 0n ? "" : num.toString(16);
+  if (hex.length % 2) hex = "0" + hex;
+  return Uint8Array.from(Buffer.concat([Buffer.alloc(leadingZeros), Buffer.from(hex, "hex")]));
 }

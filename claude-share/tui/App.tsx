@@ -1,13 +1,10 @@
 import { spawn } from "node:child_process";
 
+import { isUnlimitedSharing } from "@shared/sharing-expiry";
 import { Box, Text, useInput, useApp } from "ink";
 import React, { useState, useEffect, useCallback } from "react";
 
-import {
-  regeneratePairingCode,
-  type Machine,
-  type Session,
-} from "../session/manager.js";
+import { regeneratePairingCode, type Machine, type Session } from "../session/manager.js";
 
 const IS_DEV = process.env.NODE_ENV === "development";
 
@@ -65,6 +62,9 @@ function copyToClipboard(text: string): void {
   if (process.platform === "darwin") {
     cmd = "pbcopy";
     args = [];
+  } else if (process.platform === "win32") {
+    cmd = "clip.exe";
+    args = [];
   } else if (process.env.WAYLAND_DISPLAY) {
     cmd = "wl-copy";
     args = [];
@@ -75,9 +75,7 @@ function copyToClipboard(text: string): void {
   const proc = spawn(cmd, args, { stdio: ["pipe", "ignore", "ignore"] });
   proc.on("error", () => {
     // fallback: OSC 52 — works in most modern terminals without external tools
-    process.stdout.write(
-      `\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`,
-    );
+    process.stdout.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
   });
   proc.stdin.write(text);
   proc.stdin.end();
@@ -96,14 +94,10 @@ export function App({
 }: Props) {
   const { exit } = useApp();
   const [view, setView] = useState<View>("pairing");
-  const [pairingCode, setPairingCode] = useState(
-    () => getSession()?.pairingCode ?? "",
-  );
+  const [pairingCode, setPairingCode] = useState(() => getSession()?.pairingCode ?? "");
   const [machines, setMachines] = useState<Machine[]>([]);
   const [cursorIdx, setCursorIdx] = useState(0);
-  const [selectedMachineId, setSelectedMachineId] = useState<string | null>(
-    null,
-  );
+  const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -124,8 +118,7 @@ export function App({
   }, [machines.length]);
 
   const connectUrl = useCallback(
-    (base: string) =>
-      `claudeshare://${base.replace(/^https?:\/\//, "")}/connect/${pairingCode}`,
+    (base: string) => `claudeshare://${base.replace(/^https?:\/\//, "")}/connect/${pairingCode}`,
     [pairingCode],
   );
 
@@ -138,8 +131,7 @@ export function App({
 
     if (view === "machines") {
       if (key.upArrow) setCursorIdx((i) => Math.max(0, i - 1));
-      if (key.downArrow)
-        setCursorIdx((i) => Math.min(machines.length - 1, i + 1));
+      if (key.downArrow) setCursorIdx((i) => Math.min(machines.length - 1, i + 1));
       if (key.return && machines.length > 0) {
         setSelectedMachineId(machines[cursorIdx]?.id ?? null);
         setView("sessions");
@@ -181,14 +173,16 @@ export function App({
         <Text bold color="cyan">
           claude-share
         </Text>
-        <Text dimColor>{formatExpiry(sharedUntil)} remaining</Text>
+        <Text dimColor>
+          {isUnlimitedSharing(sharedUntil)
+            ? "No time limit"
+            : `${formatExpiry(sharedUntil)} remaining`}
+        </Text>
         <Text dimColor>:{localPort}</Text>
         {tunnelDown && (
           <Text color="red">
             ⚠ tunnel disconnected — receivers can't connect
-            {tunnelStartedAt
-              ? ` (Active for ${formatDuration(tunnelStartedAt)})`
-              : ""}
+            {tunnelStartedAt ? ` (Active for ${formatDuration(tunnelStartedAt)})` : ""}
           </Text>
         )}
       </Box>
@@ -208,24 +202,32 @@ export function App({
           <Box flexDirection="column" marginTop={1} gap={0}>
             {publicUrl ? (
               <Box>
-                <Box minWidth={10}><Text dimColor>Public</Text></Box>
+                <Box minWidth={10}>
+                  <Text dimColor>Public</Text>
+                </Box>
                 <Text>{connectUrl(publicUrl)}</Text>
               </Box>
             ) : (
               <Box>
-                <Box minWidth={10}><Text dimColor>Public</Text></Box>
+                <Box minWidth={10}>
+                  <Text dimColor>Public</Text>
+                </Box>
                 <Text dimColor>not available — local network only</Text>
               </Box>
             )}
             {lanUrl && (
               <Box>
-                <Box minWidth={10}><Text dimColor>LAN</Text></Box>
+                <Box minWidth={10}>
+                  <Text dimColor>LAN</Text>
+                </Box>
                 <Text bold>{connectUrl(lanUrl)}</Text>
               </Box>
             )}
             {IS_DEV && (
               <Box>
-                <Box minWidth={10}><Text dimColor>Local</Text></Box>
+                <Box minWidth={10}>
+                  <Text dimColor>Local</Text>
+                </Box>
                 <Text dimColor>{connectUrl(loopbackUrl)}</Text>
               </Box>
             )}
@@ -233,8 +235,8 @@ export function App({
           <Box flexDirection="column" marginTop={1} gap={0}>
             <Text dimColor>One-time code — only one machine can use it.</Text>
             <Text dimColor>
-              Ask your friend to run <Text color="white">claude-connect</Text>{" "}
-              and paste the link above.
+              Ask your friend to run <Text color="white">claude-connect</Text> and paste the link
+              above.
             </Text>
           </Box>
         </Box>
@@ -255,9 +257,7 @@ export function App({
               const cursor = i === cursorIdx;
               return (
                 <Box key={m.id} gap={1}>
-                  <Text color={cursor ? "cyan" : undefined}>
-                    {cursor ? "›" : " "}
-                  </Text>
+                  <Text color={cursor ? "cyan" : undefined}>{cursor ? "›" : " "}</Text>
                   <Text color={active ? "green" : "yellow"}>●</Text>
                   <Text bold={cursor}>{m.name}</Text>
                   <Text dimColor>— {formatRelative(last)}</Text>
@@ -294,15 +294,9 @@ export function App({
       {/* Footer */}
       <Box marginTop={1} gap={2}>
         <Text dimColor>q quit</Text>
-        {view === "pairing" && machines.length > 0 && (
-          <Text dimColor>esc back</Text>
-        )}
+        {view === "pairing" && machines.length > 0 && <Text dimColor>esc back</Text>}
         {view === "pairing" &&
-          (copied ? (
-            <Text color="green">✓ copied!</Text>
-          ) : (
-            <Text dimColor>c copy url</Text>
-          ))}
+          (copied ? <Text color="green">✓ copied!</Text> : <Text dimColor>c copy url</Text>)}
         {view === "machines" && (
           <Text dimColor>↑↓ select · enter view sessions · n new pairing</Text>
         )}

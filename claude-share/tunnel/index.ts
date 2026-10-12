@@ -1,251 +1,215 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
-import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import * as p from "@clack/prompts";
+import { resolveExecutable, spawnExecutable, type Executable } from "@shared/executables";
+import { privateTempDir } from "@shared/private-files";
+
+import { normalizeHostname } from "../proxy/policy";
 
 const execFileAsync = promisify(execFile);
-
-// Baked in at build time via --define; fall back to bore.pub in dev mode.
-const BORE_SERVER = process.env.BORE_SERVER ?? "bore.pub";
-const BORE_PASSWORD = process.env.BORE_PASSWORD ?? "";
-
-// Where we install bore on Linux when it isn't already in PATH
 const BORE_LOCAL_PATH = path.join(os.homedir(), ".local", "bin", "bore");
-
 export interface Tunnel {
   publicUrl: string | null;
   close(): void;
 }
-
-// Returns the bore binary path (from PATH or the known local install location),
-// or null if bore is not found.
 async function getBorePath(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("which", ["bore"]);
-    const p = stdout.trim();
-    if (p) return p;
+    return resolveExecutable("bore").command;
   } catch {}
   try {
     await fs.promises.access(BORE_LOCAL_PATH, fs.constants.X_OK);
     return BORE_LOCAL_PATH;
-  } catch {}
-  return null;
+  } catch {
+    return null;
+  }
 }
-
-export async function isBoreInstalled(): Promise<boolean> {
+export async function isBoreInstalled() {
   return (await getBorePath()) !== null;
 }
-
-// Follow redirects and return the final response.
-function httpsGet(url: string): Promise<import("http").IncomingMessage> {
-  return new Promise((resolve, reject) => {
-    const attempt = (target: string) => {
-      https
-        .get(target, { headers: { "User-Agent": "claude-share" } }, (res) => {
-          if (
-            (res.statusCode === 301 || res.statusCode === 302) &&
-            res.headers.location
-          ) {
-            res.resume();
-            attempt(res.headers.location);
-          } else {
-            resolve(res);
-          }
-        })
-        .on("error", reject);
-    };
-    attempt(url);
-  });
-}
-
-async function fetchJson(url: string): Promise<unknown> {
-  const res = await httpsGet(url);
-  return new Promise((resolve, reject) => {
-    let data = "";
-    res.on("data", (c: Buffer) => (data += c));
-    res.on("end", () => {
-      try {
-        resolve(JSON.parse(data));
-      } catch (e) {
-        reject(e);
+const DOWNLOAD_HOSTS = new Set([
+  "api.github.com",
+  "github.com",
+  "release-assets.githubusercontent.com",
+  "objects.githubusercontent.com",
+]);
+export async function boundedDownload(
+  url: string,
+  maxBytes: number,
+  fetcher: (url: string, options: RequestInit) => Promise<Response> = fetch,
+): Promise<Buffer> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      const target = new URL(url);
+      if (
+        target.protocol !== "https:" ||
+        target.username ||
+        target.password ||
+        !DOWNLOAD_HOSTS.has(target.hostname)
+      )
+        throw new Error("Untrusted bore download URL");
+      const response = await fetcher(url, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers: { "User-Agent": "claude-share" },
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        await response.body?.cancel();
+        const location = response.headers.get("location");
+        if (!location) throw new Error("Invalid download redirect");
+        url = new URL(location, target).href;
+        continue;
       }
-    });
-    res.on("error", reject);
-  });
-}
-
-async function downloadToFile(url: string, dest: string): Promise<void> {
-  const res = await httpsGet(url);
-  if ((res.statusCode ?? 0) < 200 || (res.statusCode ?? 0) >= 300) {
-    res.resume();
-    throw new Error(`Download failed: HTTP ${res.statusCode}`);
+      if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        throw new Error("Download failed: HTTP " + response.status);
+      }
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.length;
+          if (size > maxBytes) throw new Error("Download too large");
+          chunks.push(value);
+        }
+      } finally {
+        await reader.cancel();
+      }
+      return Buffer.concat(chunks);
+    }
+    throw new Error("Too many download redirects");
+  } finally {
+    clearTimeout(timer);
   }
-  await new Promise<void>((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    res.pipe(file);
-    file.on("finish", () => file.close(() => resolve()));
-    file.on("error", reject);
-  });
 }
-
-// Node process.arch → bore release target triple prefix
 const ARCH_MAP: Record<string, string> = {
   x64: "x86_64-unknown-linux-musl",
   arm64: "aarch64-unknown-linux-musl",
   arm: "armv7-unknown-linux-musleabihf",
   ia32: "i686-unknown-linux-musl",
 };
-
-async function installBoreLinux(): Promise<void> {
-  const triple = ARCH_MAP[process.arch];
-  if (!triple) {
+export async function installBore() {
+  if (process.platform !== "linux")
     throw new Error(
-      `No pre-built bore binary for arch "${process.arch}". ` +
-        "Install bore manually: https://github.com/ekzhang/bore",
+      "Automatic bore installation is supported on the Linux sharer only; install bore manually.",
     );
-  }
-
-  const release = (await fetchJson(
-    "https://api.github.com/repos/ekzhang/bore/releases/latest",
-  )) as { tag_name: string };
-  const tag = release.tag_name; // e.g. "v0.6.0"
-  const filename = `bore-${tag}-${triple}.tar.gz`;
-  const downloadUrl = `https://github.com/ekzhang/bore/releases/download/${tag}/${filename}`;
-
-  const tmpDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), "bore-install-"),
-  );
-  const tarPath = path.join(tmpDir, filename);
-
-  try {
-    await downloadToFile(downloadUrl, tarPath);
-
-    // Archive contains a single file named "bore" at root
-    await execFileAsync("tar", ["xzf", tarPath, "-C", tmpDir, "bore"]);
-
-    const installDir = path.dirname(BORE_LOCAL_PATH);
-    await fs.promises.mkdir(installDir, { recursive: true });
-    await fs.promises.copyFile(path.join(tmpDir, "bore"), BORE_LOCAL_PATH);
-    await fs.promises.chmod(BORE_LOCAL_PATH, 0o755);
-  } finally {
-    await fs.promises.rm(tmpDir, { recursive: true, force: true });
-  }
-}
-
-export async function installBore(): Promise<void> {
+  const triple = ARCH_MAP[process.arch];
+  if (!triple) throw new Error("No bore binary for this architecture; install bore manually.");
   const spin = p.spinner();
-
-  if (process.platform === "linux") {
-    spin.start("Downloading bore binary from GitHub...");
+  spin.start("Downloading bore from GitHub...");
+  const dir = privateTempDir("bore-install-");
+  try {
+    const release = JSON.parse(
+      (
+        await boundedDownload(
+          "https://api.github.com/repos/ekzhang/bore/releases/latest",
+          1024 * 1024,
+        )
+      ).toString("utf8"),
+    );
+    const tag = release.tag_name;
+    if (typeof tag !== "string" || !/^v?\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?$/.test(tag))
+      throw new Error("Invalid bore release");
+    const filename = "bore-" + tag + "-" + triple + ".tar.gz";
+    const archive = await boundedDownload(
+      "https://github.com/ekzhang/bore/releases/download/" + tag + "/" + filename,
+      32 * 1024 * 1024,
+    );
+    const digest = release.assets?.find((a: { name: string }) => a.name === filename)?.digest;
+    if (
+      digest &&
+      (typeof digest !== "string" ||
+        digest !== "sha256:" + createHash("sha256").update(archive).digest("hex"))
+    )
+      throw new Error("Bore checksum mismatch");
+    const archivePath = path.join(dir, filename);
+    fs.writeFileSync(archivePath, archive, { mode: 0o600 });
+    await execFileAsync("tar", ["xzf", archivePath, "-C", dir, "bore"], { timeout: 30_000 });
+    if (!fs.lstatSync(path.join(dir, "bore")).isFile()) throw new Error("Invalid bore archive");
+    fs.mkdirSync(path.dirname(BORE_LOCAL_PATH), { recursive: true });
+    const staging = BORE_LOCAL_PATH + ".install-" + path.basename(dir);
     try {
-      await installBoreLinux();
-      spin.stop(`bore installed to ${BORE_LOCAL_PATH}`);
-      return;
-    } catch (err) {
-      spin.stop(`Binary download failed: ${(err as Error).message}. Falling back to cargo...`);
+      fs.copyFileSync(path.join(dir, "bore"), staging, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(staging, 0o755);
+      fs.renameSync(staging, BORE_LOCAL_PATH);
+    } finally {
+      if (fs.existsSync(staging)) fs.unlinkSync(staging);
     }
-    // Fallback: cargo
-    spin.start("Running: cargo install bore-cli");
-    try {
-      await execFileAsync("cargo", ["install", "bore-cli"]);
-      spin.stop("bore installed via cargo.");
-    } catch (err) {
-      spin.stop("Installation failed.");
-      throw new Error(`Could not install bore: ${(err as Error).message}`);
-    }
-    return;
+    spin.stop("Bore installed.");
+  } catch (err) {
+    spin.stop("Installation failed; install bore manually.");
+    throw err;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
-
-  if (process.platform === "darwin") {
-    let bin: string;
-    let args: string[];
-    let label: string;
-    try {
-      await execFileAsync("which", ["brew"]);
-      bin = "brew";
-      args = ["install", "bore-cli"];
-      label = "brew install bore-cli";
-    } catch {
-      bin = "cargo";
-      args = ["install", "bore-cli"];
-      label = "cargo install bore-cli";
-    }
-    spin.start(`Running: ${label}`);
-    try {
-      await execFileAsync(bin, args);
-      spin.stop("bore installed.");
-    } catch (err) {
-      spin.stop("Installation failed.");
-      throw new Error(`Could not install bore: ${(err as Error).message}`);
-    }
-    return;
-  }
-
-  throw new Error(
-    "Unsupported platform — install bore manually: https://github.com/ekzhang/bore",
-  );
 }
-
 export async function startTunnel(
   localPort: number,
   onDown?: () => void,
+  executable?: Executable,
 ): Promise<Tunnel> {
-  const boreBin = (await getBorePath()) ?? "bore";
-  const args = ["local", String(localPort), "--to", BORE_SERVER];
-  if (BORE_PASSWORD) args.push("--secret", BORE_PASSWORD);
-
+  const server = normalizeHostname(process.env.BORE_SERVER ?? "bore.pub");
+  const password = process.env.BORE_PASSWORD ?? "";
+  const binary = executable?.command ?? (await getBorePath());
+  if (!binary) throw new Error("Bore is not installed");
+  const args = ["local", String(localPort), "--to", server];
+  if (password) args.push("--secret", password);
   return new Promise((resolve, reject) => {
-    const proc = spawn(boreBin, args, { stdio: ["ignore", "pipe", "pipe"] });
-
+    const proc = spawnExecutable(executable ?? { command: binary, args: [] }, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
     let settled = false;
     let closing = false;
     const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        proc.kill();
-        reject(new Error("bore timed out"));
-      }
+      if (settled) return;
+      settled = true;
+      closing = true;
+      proc.kill();
+      reject(new Error("Bore timed out"));
     }, 30_000);
-
-    function onData(chunk: Buffer) {
-      const text = chunk.toString();
-      const match = text.match(/listening at \S+:(\d+)/i);
-      if (match && !settled) {
+    // Keep stdout/stderr framing separate, and retain partial lines.
+    const tails = { stdout: "", stderr: "" };
+    const data = (stream: keyof typeof tails, chunk: Buffer) => {
+      tails[stream] = (tails[stream] + chunk.toString()).slice(-16 * 1024);
+      const match = tails[stream].match(/listening at \S+:(\d+)(?:\r?\n)/i);
+      const port = match ? Number(match[1]) : 0;
+      if (!settled && Number.isInteger(port) && port > 0 && port <= 65535) {
         settled = true;
         clearTimeout(timeout);
         resolve({
-          publicUrl: `https://${BORE_SERVER}:${match[1]}`,
+          publicUrl: "https://" + server + ":" + port,
           close() {
             closing = true;
             proc.kill();
           },
         });
       }
-    }
-
-    proc.stdout.on("data", onData);
-    proc.stderr.on("data", onData);
-
-    proc.on("error", (err) => {
+    };
+    proc.stdout!.on("data", (chunk) => data("stdout", chunk));
+    proc.stderr!.on("data", (chunk) => data("stderr", chunk));
+    proc.once("error", (err) => {
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
         reject(err);
       }
     });
-
-    proc.on("exit", (code) => {
+    proc.once("exit", (code) => {
+      clearTimeout(timeout);
       if (!settled) {
         settled = true;
-        clearTimeout(timeout);
-        reject(new Error(`bore exited with code ${code}`));
-      } else if (!closing) {
-        onDown?.();
-      }
+        reject(new Error("Bore exited with code " + code));
+      } else if (!closing) onDown?.();
     });
   });
 }

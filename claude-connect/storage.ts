@@ -2,43 +2,31 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import type { ReceiverConfig, SavedConnection } from "./types";
+import { atomicPrivateWrite, ensurePrivateDir, protectPath } from "@shared/private-files";
+import { record, uuid, isoDate, validateConnection } from "@shared/validation";
 
-// ── Paths ────────────────────────────────────────────────────────────────────
+import type { ReceiverConfig, SavedConnection } from "./types";
 
 export const CLAUDE_SHARE_DIR = path.join(os.homedir(), ".claude-share");
 export const CONNECTIONS_DIR = path.join(CLAUDE_SHARE_DIR, "connections");
 const CONFIG_FILE = path.join(CLAUDE_SHARE_DIR, "config.json");
-
 export function ensureConnectionsDir() {
-  fs.mkdirSync(CONNECTIONS_DIR, { recursive: true });
+  ensurePrivateDir(CLAUDE_SHARE_DIR);
+  ensurePrivateDir(CONNECTIONS_DIR);
 }
-
 export function connectionPath(id: string) {
-  const resolved = path.resolve(CONNECTIONS_DIR, `${id}.json`);
-  if (!resolved.startsWith(CONNECTIONS_DIR + path.sep)) {
-    throw new Error(`Invalid connection ID: ${id}`);
-  }
-  return resolved;
+  return path.join(CONNECTIONS_DIR, uuid(id) + ".json");
 }
-
-// ── Device config ─────────────────────────────────────────────────────────────
-
 function readConfig(): ReceiverConfig | null {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) as ReceiverConfig;
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
   } catch {
     return null;
   }
 }
-
-function writeConfig(config: ReceiverConfig): void {
-  fs.mkdirSync(CLAUDE_SHARE_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), {
-    mode: 0o600,
-  });
+function writeConfig(config: ReceiverConfig) {
+  atomicPrivateWrite(CONFIG_FILE, JSON.stringify({ ...readConfig(), ...config }, null, 2));
 }
-
 export function getDeviceName(): string {
   const saved = readConfig();
   if (saved?.deviceName) return saved.deviceName;
@@ -46,67 +34,57 @@ export function getDeviceName(): string {
   writeConfig({ deviceName: name });
   return name;
 }
-
-export function hasAgreedToTerms(): boolean {
+export function hasAgreedToTerms() {
   return readConfig()?.hasConnectTermsAgreed === true;
 }
-
-export function saveTermsAgreed(): void {
-  const cfg = readConfig() ?? { deviceName: os.hostname() };
-  writeConfig({ ...cfg, hasConnectTermsAgreed: true });
+export function saveTermsAgreed() {
+  writeConfig({ ...(readConfig() ?? { deviceName: os.hostname() }), hasConnectTermsAgreed: true });
 }
-
-// ── Connection persistence ────────────────────────────────────────────────────
-
 export function loadConnections(): SavedConnection[] {
   ensureConnectionsDir();
-  return fs
-    .readdirSync(CONNECTIONS_DIR)
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => {
-      try {
-        return JSON.parse(
-          fs.readFileSync(path.join(CONNECTIONS_DIR, f), "utf8"),
-        ) as SavedConnection;
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean) as SavedConnection[];
-}
-
-export function pruneExpiredConnections(): void {
-  ensureConnectionsDir();
-  const now = Date.now();
-  for (const file of fs
-    .readdirSync(CONNECTIONS_DIR)
-    .filter((f) => f.endsWith(".json"))) {
-    const filePath = path.join(CONNECTIONS_DIR, file);
+  const connections: SavedConnection[] = [];
+  for (const filename of fs.readdirSync(CONNECTIONS_DIR).filter((f) => f.endsWith(".json"))) {
     try {
-      const c = JSON.parse(
-        fs.readFileSync(filePath, "utf8"),
-      ) as Partial<SavedConnection>;
-      // Remove if sharedUntil is present and in the past; leave legacy entries without it alone
-      if (c.sharedUntil && new Date(c.sharedUntil).getTime() < now) {
-        fs.unlinkSync(filePath);
-      }
+      const file = path.join(CONNECTIONS_DIR, filename);
+      if (!fs.lstatSync(file).isFile() || fs.statSync(file).size > 256 * 1024)
+        throw new Error("Invalid connection file");
+      protectPath(file);
+      const raw = record(JSON.parse(fs.readFileSync(file, "utf8")));
+      const connection = validateConnection(raw);
+      const id = uuid(raw.id);
+      if (id !== connection.proxyUser || filename !== id + ".json")
+        throw new Error("Connection identity mismatch");
+      connections.push({ ...connection, id, savedAt: isoDate(raw.savedAt) });
+    } catch (err) {
+      process.stderr.write(
+        "Ignoring invalid saved connection " +
+          filename +
+          ": " +
+          (err as Error).message +
+          ". Remove it and pair again.\n",
+      );
+    }
+  }
+  return connections;
+}
+export function pruneExpiredConnections() {
+  ensureConnectionsDir();
+  for (const filename of fs.readdirSync(CONNECTIONS_DIR).filter((f) => f.endsWith(".json"))) {
+    const file = path.join(CONNECTIONS_DIR, filename);
+    try {
+      if (!fs.lstatSync(file).isFile() || fs.statSync(file).size > 256 * 1024) continue;
+      const raw = record(JSON.parse(fs.readFileSync(file, "utf8")));
+      if (typeof raw.sharedUntil === "string" && Date.parse(raw.sharedUntil) <= Date.now())
+        fs.unlinkSync(file);
     } catch {
-      // Corrupt file — remove it too
-      try {
-        fs.unlinkSync(filePath);
-      } catch {}
+      /* loadConnections reports invalid entries with recovery instructions. */
     }
   }
 }
-
-export function findConnectionByServerUrl(
-  serverUrl: string,
-): SavedConnection | null {
-  const all = loadConnections().filter(
-    (c) => c.lanServerUrl === serverUrl || c.publicServerUrl === serverUrl,
+export function findConnectionByServerUrl(serverUrl: string): SavedConnection | null {
+  return (
+    loadConnections()
+      .filter((c) => c.lanServerUrl === serverUrl || c.publicServerUrl === serverUrl)
+      .sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt))[0] ?? null
   );
-  if (all.length === 0) return null;
-  return all.sort(
-    (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime(),
-  )[0];
 }
